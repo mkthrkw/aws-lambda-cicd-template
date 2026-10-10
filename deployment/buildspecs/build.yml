@@ -1,0 +1,39 @@
+# Build Stage用のCodeBuild定義。
+# 全RuntimeをビルドしてBuildArtifact（後続Deployが使う成果物）を作ります。
+# AWSのResourceは変更しません。処理の詳細は deployment/README.md を参照してください。
+#
+# 入力: SourceArtifact（GitHubから取得したソース一式）
+# 出力: BuildArtifact（build/ 配下をそのままの階層で格納）
+version: 0.2   # Buildspecの書式バージョン。CodeBuildでは0.2を使用します。
+
+env:
+  variables:
+    SAM_CLI_TELEMETRY: '0'   # SAM CLIの利用統計送信を止め、CIの外部通信を減らします。
+
+phases:
+  install:
+    on-failure: ABORT        # 依存の導入に失敗したら、以降のphaseへ進まず中止します。
+    runtime-versions:
+      python: '3.12'         # Lambda側のRuntime（python3.12）に合わせます。
+    commands:
+      # SAM CLIとcfn-lintをバージョン固定で導入します（ツール差による結果のぶれを防止）。
+      - python -m pip install -r deployment/buildspecs/requirements.txt
+      # 実際に入ったバージョンをログへ残し、後から再現・追跡できるようにします。
+      - python --version
+      - sam --version
+      - cfn-lint --version
+  build:
+    on-failure: ABORT
+    commands:
+      # ビルド手順の本体はbuild.pyにまとめています（Buildspecへ重複記述しないため）。
+      # `${VAR:?メッセージ}` は「未設定・空文字なら即エラー」というシェルの書き方です。
+      # DEPLOY_ENVはCI Stackから、AWS_REGIONはCodeBuildから渡されます。
+      - python -m deployment.scripts.build --environment "${DEPLOY_ENV:?DEPLOY_ENV is required}" --region "${AWS_REGION:?AWS_REGION is required}"
+
+# 成果物の指定。build/ をArtifactのルートとして、その下を丸ごと引き渡します。
+artifacts:
+  base-directory: build      # このディレクトリを基準に以下のfilesを収集します。
+  files:
+    - 'runtimes/**/*'        # ビルド済みTemplateとコード・依存ライブラリ
+    - 'configuration/**/*'   # 対象環境のParameter設定
+  discard-paths: no          # 階層を平坦化しません。CodeUriの相対解決に必要です。

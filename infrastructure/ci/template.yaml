@@ -1,0 +1,765 @@
+# CI Stack Template
+#
+# GitHubへのpushをきっかけに、Test → Build → Deploy を自動で実行するPipelineを作ります。
+#
+#   GitHub ──(Source)──> SourceArtifact ──(Test)──> pytest
+#                              │
+#                              └──(Build)──> BuildArtifact ──(Deploy)──> Runtime Stack
+#
+# このStackが作るもの
+#   - GitHub Connection（GitHubからソースを取得する接続）
+#   - Artifact Bucket（Stage間でソースやビルド成果物を受け渡すS3 Bucket）
+#   - CodeBuild Project 3つ（Test / Build / Deploy の実行環境）とそのIAM Role・Log Group
+#   - CodePipeline（上記を順番につなぐ）
+#   - 通知用のSNS Topicと、Pipeline失敗を検知するEventBridge Rule
+#
+# Bootstrap Stackを先に作っておく必要があります。CI StackはBootstrap StackがExportした
+# Execution Role ARNとDeployment Bucket名をImportValueで取り込みます（値を手で転記しません）。
+#
+# Stack作成後に管理者が行う作業
+#   - GitHub Connectionの認証（作成直後は PENDING 状態で、コンソールから承認が必要）
+#   - 通知の受け取り先を、作成されたSNS Topicへ登録する（購読はこのTemplateで管理しません）
+#
+# このStackはPipelineからは更新されません。変更したら管理者がCloudShellから更新します。
+#
+# Tag（Project / Environment / ManagedBy）はTemplateに書きません。Stackを作成・更新する
+# コマンドに --tags で指定し、CloudFormationが各Resourceへ伝播させます（README.mdの構築手順）。
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI pipeline, isolated build roles, artifacts, and operational notifications.
+
+# Stack作成時に渡す値。infrastructure/env/<環境>/setup-parameters.json にまとめています。
+Parameters:
+  # Stack名やResource名の先頭に付く名前。Bootstrap Stackと同じ値にします。
+  ProjectName:
+    Type: String
+    Description: Lowercase project prefix shared by Bootstrap, CI, and Runtime stacks.
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$'
+    ConstraintDescription: Use lowercase letters, numbers, and single hyphens; start with a letter.
+  # 環境の識別子。Stack名やResource名に入り、環境ごとに別のStackとして作られます。
+  # dev / stg / prodはそれぞれ別のAWS Accountに作る前提です。
+  Environment:
+    Type: String
+    Description: Deployment environment managed in this AWS account.
+    AllowedValues: [dev, stg, prod]
+  # 監視するGitHubリポジトリ。例: my-org/my-repository
+  GitHubRepositoryId:
+    Type: String
+    Description: GitHub repository in owner/repository format.
+    MinLength: 3
+    MaxLength: 201
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    ConstraintDescription: Use owner/repository format without credentials.
+  # このブランチへのpushでPipelineが動きます。例: devは develop、prodは production
+  BranchName:
+    Type: String
+    Description: Git branch monitored by the source action.
+    MinLength: 1
+    MaxLength: 255
+
+Conditions:
+  # prod環境のときだけ、配備前に人の承認を挟みます。
+  IsProd: !Equals [!Ref Environment, 'prod']
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # ソースの取得とArtifactの保管
+  # ---------------------------------------------------------------------------
+
+  # CodePipelineがGitHubからソースを取得するための接続です。
+  # CloudFormationで作った直後は PENDING のため、コンソールでGitHub認証を完了させます。
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: !Sub '${ProjectName}-${Environment}'
+      ProviderType: GitHub
+
+  # Stage間でArtifact（ソースのZIPやビルド成果物）を受け渡すためのS3 Bucketです。
+  # Lambdaのコード置き場（Bootstrap StackのDeployment Bucket）とは別のBucketです。
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    # Stackを削除してもBucketは残します。中身が残ったBucketはCloudFormationで削除できず、
+    # Stackの削除自体が失敗するためです。不要になったら手動で空にして削除します。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Bucket名は固定せず、Account内の衝突をCloudFormationに回避させます。
+      # 暗号化・所有者の強制・公開アクセスのブロックで、Bucketを非公開に保ちます。
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      # CodePipelineはArtifactのキーをPipeline名の先頭20文字から作ります。
+      # CloudFormationでは切り詰めた値を作れないため、Pipeline専用のBucketとし、
+      # 保持期間もBucket全体へ適用します。
+      LifecycleConfiguration:
+        Rules:
+          # Artifactは各実行の受け渡しにだけ使うため、30日で削除します。
+          - Id: ExpirePipelineArtifacts
+            Status: Enabled
+            Prefix: ''
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          # 途中で止まったアップロードの断片は課金対象のため、7日で片付けます。
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # HTTPS以外（暗号化されていない通信）でのアクセスをすべて拒否します。
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------------------
+  # CodeBuildのログ出力先
+  # ---------------------------------------------------------------------------
+  # CodeBuildに自動作成させず、ここで先に作ります。保持期間を決められるほか、
+  # CodeBuildのRoleへLog Groupの作成権限を渡さずに済むためです。
+  # 名前はCodeBuildの既定の出力先 /aws/codebuild/<Project名> に合わせています。
+
+  TestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-${Environment}-test'
+      RetentionInDays: 30
+
+  # Build Stage用。TestLogGroupと同じ作り方です。
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-${Environment}-build'
+      RetentionInDays: 30
+
+  # Deploy Stage用。TestLogGroupと同じ作り方です。
+  DeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-${Environment}-deploy'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # IAM Role
+  # ---------------------------------------------------------------------------
+  # Pipeline本体と、Test / Build / DeployのCodeBuildで別々のRoleを使います。
+  # 1つにまとめると、pytestを動かすだけのTestにもDeployの権限が付いてしまうためです。
+  #
+  # どのRoleにも Path /<ProjectName>/<Environment>/ci/ を付けます。
+  # Bootstrap StackのExecution Roleが操作できるのは /runtime/ のRoleだけなので、
+  # Runtime TemplateからこれらのRoleの権限を変更することはできません。
+
+  # CodePipeline自身が使うRoleです。
+  # GitHubからのソース取得、CodeBuildの起動、Artifactの読み書きだけを許可します。
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/${ProjectName}/${Environment}/ci/'
+      # このRoleを引き受けられるのはCodePipelineだけです。
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CodePipelineOnly
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunApplicationPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CodeConnectionsは旧名CodeStar Connectionsから改名されたため、両方のAction名を許可します。
+              - Sid: UseGitHubConnection
+                Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnection
+              # 各StageでCodeBuildを起動し、終わるまで状態を確認します。
+              - Sid: RunPipelineBuilds
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt TestProject.Arn
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+              - Sid: ReadArtifactBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                Resource: !GetAtt ArtifactBucket.Arn
+              # 承認待ちの通知をSNS Topicへ送ります（prodの承認Stageで使用）。
+              - Sid: NotifyApproval
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref OperationsTopic
+              # SourceArtifactの保存と、Stage間の受け渡しに使います。
+              - Sid: TransferPipelineArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+  # Test StageのCodeBuildが使うRoleです。pytestを動かすだけなので、
+  # ログの書き込みとSourceArtifactの読み取りだけを許可し、AWSのResourceは変更できません。
+  TestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/${ProjectName}/${Environment}/ci/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CodeBuildOnly
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TestSource
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteTestLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-test:*'
+              - Sid: ReadArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: ReadPipelineArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+  # Build StageのCodeBuildが使うRoleです。
+  # Testとの違いは、BuildArtifactをArtifact Bucketへ書き込むPutObjectだけです。
+  # sam buildはローカルでの処理なので、AWSのResourceを変更する権限は持ちません。
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/${ProjectName}/${Environment}/ci/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CodeBuildOnly
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildArtifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-build:*'
+              - Sid: ReadArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: TransferPipelineArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+  # Deploy StageのCodeBuildが使うRoleです。sam deploy を実行します。
+  #
+  # このRoleはLambdaやIAM Roleを直接は作りません。Change Set（変更内容）を作って
+  # CloudFormationへ実行を依頼するだけで、実際の作成・更新はBootstrap Stackの
+  # Execution Roleが行います。そのため、このRoleの権限は次の範囲に限られます。
+  #   - SAM資材（コードのZIPとTemplate）をDeployment Bucketへアップロードする
+  #   - Runtime StackのChange Setを作成・実行する
+  #   - Execution RoleをCloudFormationへ渡す（iam:PassRole）
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: !Sub '/${ProjectName}/${Environment}/ci/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CodeBuildOnly
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployRuntimeStacks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteDeployLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-${Environment}-deploy:*'
+              # SourceArtifactとBuildArtifactを読み取ります（書き込みはしません）。
+              - Sid: ReadArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: ReadPipelineArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              # Deployment BucketはBootstrap Stackが作ります。Bucket名はそのExportから取り込みます。
+              - Sid: ReadDeploymentBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource:
+                  Fn::Sub:
+                    - 'arn:${AWS::Partition}:s3:::${DeploymentBucketName}'
+                    - DeploymentBucketName:
+                        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-DeploymentBucketName'
+              # SAMはアップロード前に同じ内容の資材が既にあるかを確認し、あれば再アップロードしません。
+              # ListBucketが無いと「無い」と「読めない」を区別できないため、runtimes/ に限って許可します。
+              - Sid: ListRuntimeArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::Sub:
+                    - 'arn:${AWS::Partition}:s3:::${DeploymentBucketName}'
+                    - DeploymentBucketName:
+                        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-DeploymentBucketName'
+                Condition:
+                  StringLike:
+                    s3:prefix: runtimes/*
+              - Sid: ManageRuntimeArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  Fn::Sub:
+                    - 'arn:${AWS::Partition}:s3:::${DeploymentBucketName}/runtimes/*'
+                    - DeploymentBucketName:
+                        Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-DeploymentBucketName'
+              # deploy.pyが、配備前に「今の認証情報が想定のAWS Accountか」を確認するために使います。
+              # このActionはResourceを指定できないため '*' です。
+              - Sid: VerifyDeploymentAccount
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+              # SAM CLIのChange Set作成先、名前、Execution Roleを同時に限定します。
+              # cloudformation:RoleArn の条件により、Execution Role以外のRoleでは作成できません。
+              - Sid: CreateRuntimeChangeSets
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${Environment}-*/*'
+                Condition:
+                  ArnEquals:
+                    cloudformation:RoleArn:
+                      Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-RuntimeExecutionRoleArn'
+                  StringLike:
+                    cloudformation:ChangeSetName: samcli-deploy*
+              # 作成済みChange Setの参照・実行・削除。SAM CLIはこれらをChange SetのARNで呼ぶため、
+              # Change Set名の条件（cloudformation:ChangeSetName）が一致せず拒否されます（実環境で確認）。
+              # そのため名前の条件は付けず、対象Stackで限定します。
+              - Sid: ManageRuntimeChangeSets
+                Effect: Allow
+                Action:
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${Environment}-*/*'
+              # 上のStack範囲にはBootstrap / CI Stackも含まれます。管理者が作ったChange Setを
+              # Deploy Roleが実行できないよう、この2つのStackへのChange Set操作を明示的に拒否します。
+              # Runtime名bootstrap / ciは予約済みのため、Runtime Stackがこの名前になることはありません。
+              # IAMでは許可（Allow）より拒否（Deny）が常に優先されます。
+              - Sid: DenySetupStackChangeSets
+                Effect: Deny
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ExecuteChangeSet
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${Environment}-bootstrap/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${Environment}-ci/*'
+              # SAMが既存StackのParameterを確認したり、配備の進捗（Event）を表示したりするために使います。
+              - Sid: ReadRuntimeStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-${Environment}-*/*'
+              # `sam deploy --role-arn` でExecution RoleをCloudFormationへ渡すには、
+              # 渡す側（このRole）に iam:PassRole が必要です。渡し先はCloudFormationだけに限定します。
+              - Sid: PassRuntimeExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-RuntimeExecutionRoleArn'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
+  # ---------------------------------------------------------------------------
+  # CodeBuild Project（各Stageの実行環境）
+  # ---------------------------------------------------------------------------
+  # 実行する内容は、リポジトリの deployment/buildspecs/*.yml（BuildSpec）に書いています。
+  # 共通の設定
+  #   - Image: aws/codebuild/standard:7.0（Python 3.12を含むLinuxのビルド環境）
+  #   - PrivilegedMode: false（Dockerを使わないため、特権モードは無効）
+  #   - ConcurrentBuildLimit: 1（同じProjectを同時に2つ実行しない）
+
+  # Test Stage: pytestを実行します。
+  TestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-test'
+      ServiceRole: !GetAtt TestRole.Arn
+      # 入力はPipelineから受け取ります（CodeBuild単体でGitHubを読みに行きません）。
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspecs/test.yml
+      # SourceがCODEPIPELINEのProjectは、ArtifactsもCODEPIPELINEでなければ作成できません。
+      # 出力の有無はPipeline ActionのOutputArtifactsで決まり、この段階は出力を持ちません。
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+      TimeoutInMinutes: 15
+      QueuedTimeoutInMinutes: 60
+      ConcurrentBuildLimit: 1
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref TestLogGroup
+
+  # Build Stage: 全Runtimeを sam build し、BuildArtifactを作ります。
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-build'
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspecs/build.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+        # BuildSpecから参照する環境変数です。どの環境の設定ファイルを使うかを決めます。
+        EnvironmentVariables:
+          - Name: DEPLOY_ENV
+            Type: PLAINTEXT
+            Value: !Ref Environment
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 60
+      ConcurrentBuildLimit: 1
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+
+  # Deploy Stage: BuildArtifactを検証し、Runtimeごとに sam deploy します。
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-deploy'
+      ServiceRole: !GetAtt DeployRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspecs/deploy.yml
+      # 出力は持ちませんが、TestProjectと同じ理由でCODEPIPELINEを指定します。
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+        # deploy.pyが読む実行設定です。どれもStackの値から自動で設定し、Gitには置きません。
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Type: PLAINTEXT
+            Value: !Ref ProjectName
+          - Name: DEPLOY_ENV
+            Type: PLAINTEXT
+            Value: !Ref Environment
+          # AWS_REGIONはCodeBuildの組込み値を利用します。
+          # 配備先のAccount ID。deploy.pyがSTSの結果と比べ、別Accountへの誤配備を防ぎます。
+          - Name: EXPECTED_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          # SAM資材のアップロード先（Bootstrap StackのExport）
+          - Name: DEPLOYMENT_BUCKET
+            Type: PLAINTEXT
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-DeploymentBucketName'
+          # sam deploy --role-arn で渡すExecution Role（Bootstrap StackのExport）
+          - Name: CFN_EXECUTION_ROLE_ARN
+            Type: PLAINTEXT
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-${Environment}-bootstrap-RuntimeExecutionRoleArn'
+          # Runtime StackのAlarmが通知する先。Runtime TemplateのAlarmTopicArnへ注入されます。
+          - Name: OPERATIONS_TOPIC_ARN
+            Type: PLAINTEXT
+            Value: !Ref OperationsTopic
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 60
+      ConcurrentBuildLimit: 1
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref DeployLogGroup
+
+  # ---------------------------------------------------------------------------
+  # Pipeline
+  # ---------------------------------------------------------------------------
+  # Source → Test → Build → Deploy の順に実行し、1つでも失敗したらそこで止まります。
+  # 各Stageは、前のStageが出力したArtifact（名前付きのZIP）を入力として受け取ります。
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-pipeline'
+      # QUEUEDは、実行中に新しいpushがあっても前の実行を中断せず、順番待ちにする方式です。
+      # Stageは同時に1つの実行しか受け付けないため、後の実行は先行の実行を追い越せません。
+      # これによりDeployが同じRuntime Stackを同時に更新することを防ぎます。V2でのみ使えます。
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      # CI Stackを更新しただけでPipelineが自動実行されないようにします。
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # GitHubの指定ブランチを取得し、SourceArtifactとして保存します。
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepositoryId
+                BranchName: !Ref BranchName
+                # ブランチへのpushを検知して、Pipelineを自動で開始します。
+                DetectChanges: 'true'
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+        # 出力はありません。テストが失敗すると、BuildとDeployは実行されません。
+        - Name: Test
+          Actions:
+            - Name: Test
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TestProject
+                PrimarySource: SourceArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+        # ビルド結果をBuildArtifactとして出力し、Deployへ渡します。
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+                PrimarySource: SourceArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+        # prodだけ、配備の前に人の承認を待ちます。承認されるまでDeployは始まりません。
+        # 承認しないまま既定の7日が過ぎると、Pipelineは失敗します。
+        # devとstgでは、この要素ごとTemplateから消えます（AWS::NoValue）。
+        - !If
+          - IsProd
+          - Name: Approval
+            Actions:
+              - Name: Approval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: '1'
+                Configuration:
+                  # 承認待ちを通知します。届く先は、このTopicへ登録した購読先です。
+                  NotificationArn: !Ref OperationsTopic
+                  # 承認画面に出る説明です。どの環境への配備かを示します。
+                  CustomData: !Sub '${ProjectName}-${Environment} へ配備します。Test / Buildは成功済みです。'
+                RunOrder: 1
+          - !Ref AWS::NoValue
+        # 入力は2つです。BuildSpecとdeploy.pyはSourceArtifactから、
+        # 配備する資材はBuildArtifactから読みます（ここで再ビルドはしません）。
+        # PrimarySourceは、BuildSpecを探す入力と作業ディレクトリを決める指定です。
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployProject
+                PrimarySource: SourceArtifact
+              InputArtifacts:
+                - Name: SourceArtifact
+                - Name: BuildArtifact
+              RunOrder: 1
+
+  # ---------------------------------------------------------------------------
+  # 通知
+  # ---------------------------------------------------------------------------
+  # Pipelineの失敗とRuntime StackのAlarmを、このSNS Topicへ集めます。
+  #
+  #   Pipeline失敗 ──> PipelineFailureRule ──┐
+  #                                         ├──> OperationsTopic ──> 登録した受け取り先
+  #   Runtime StackのAlarm ─────────────────┘
+  #
+  # 受け取り先（購読）はこのTemplateで管理しません。誰に通知するかは環境ごとの運用設定で、
+  # Gitで管理すると個人のメールアドレスをリポジトリへ残すことになるためです。
+  # 構築後に、コンソールまたはCLIでTopicへ購読を追加します（README.mdの構築手順）。
+
+  OperationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      # deploy.pyがこの名前を前提に検証するため、名前を固定しています。
+      TopicName: !Sub '${ProjectName}-${Environment}-operations'
+
+  # EventBridge Rule。このPipelineの実行が失敗（FAILED）したイベントだけをTopicへ送ります。
+  PipelineFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Publish this pipeline's failed execution events to the operations topic.
+      EventPattern:
+        source:
+          - aws.codepipeline
+        detail-type:
+          - CodePipeline Pipeline Execution State Change
+        detail:
+          pipeline:
+            - !Ref Pipeline
+          state:
+            - FAILED
+      State: ENABLED
+      Targets:
+        - Id: OperationsTopic
+          Arn: !Ref OperationsTopic
+
+  # SNS Topicへの発行（Publish）を許可する相手を決めるPolicyです。
+  # AWSのサービスがTopicへ送るには、この許可が必要です。
+  # 同じAccountの、このProjectのAlarmと、上のRuleからの発行だけを許可します。
+  OperationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OperationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowProjectAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OperationsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-${Environment}-*'
+          - Sid: AllowPipelineFailureRule
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OperationsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+                AWS:SourceArn: !GetAtt PipelineFailureRule.Arn
+
+# Stack作成後に確認する値。`aws cloudformation describe-stacks` やコンソールで見られます。
+Outputs:
+  GitHubConnectionArn:
+    Description: Complete this connection in the AWS console before using the source action.
+    Value: !Ref GitHubConnection
+  # コンソールでPipelineを探すときや、CLIで実行状態を見るときに使います。
+  PipelineName:
+    Description: Name of the application delivery pipeline.
+    Value: !Ref Pipeline
+  # Stage間の受け渡しに使うBucket。SAM資材を置くDeployment Bucketとは別物です。
+  ArtifactBucketName:
+    Description: Bucket used only for CodePipeline artifacts.
+    Value: !Ref ArtifactBucket
+  # 通知の受け取り先（購読）を登録するときに指定するTopicです。
+  OperationsTopicArn:
+    Description: Injected into Runtime AlarmTopicArn by the Deploy project.
+    Value: !Ref OperationsTopic

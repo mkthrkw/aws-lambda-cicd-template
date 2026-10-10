@@ -1,0 +1,483 @@
+# Runtime Stack Template（SAM）: 複数のLambdaをStep Functionsで順に実行するジョブ
+#
+# 1 Runtime Stackは1つのデプロイ単位です。この例では、3つのLambdaと、
+# それらを順に呼び出すState Machineをまとめて管理します。
+# 単独のLambdaの例は infrastructure/runtimes/sample-batch-a/ にあります。
+#
+# 定期実行の流れ
+#   EventBridge Scheduler ──> State Machine ──> fetch:live ──> transform:live ──> notify:live
+#                                                   │              │               │
+#                                                   └── 各Lambdaは自分のLog Groupへ出力
+#
+# 前のステップの戻り値が、そのまま次のステップの入力になります。
+# どこまで進んだかはStep Functionsの実行履歴で追えます。
+#
+# 別のジョブを作るときは、このディレクトリをコピーし、CodeUriとStepの構成を変更します。
+#
+# Resource名は、Stack名 <ProjectName>-<Environment>-<Runtime名> にステップ名を付けて決めます。
+# 例: <Stack名>-fetch、<Stack名>-fetch-execution。名前の長さの上限は
+# infrastructure/tests/test_resource_names.py で確認します。
+#
+# IAM Roleには /<ProjectName>/<Environment>/runtime/ のPathを付けます。
+# Log Groupだけは、Stack削除後も残す設定のため名前を固定しません。
+
+#
+# Tag（Project / Environment / ManagedBy）はTemplateに書きません。Deploy Stageの sam deploy が
+# Stackへ付け、CloudFormationが各Resourceへ伝播させます。Runtimeを追加しても同じTagが付きます。
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: One scheduled job that runs three Lambdas in order with Step Functions.
+
+# デプロイ時に外から渡す設定値。単独Lambdaの構成（sample-batch-a）と同じ項目です。
+# 値はこのDefaultを土台に、以下のJSONで上書きされます。
+#   infrastructure/runtimes/<Runtime名>/parameters.json（Runtime共通）
+#   infrastructure/env/<環境>/runtime-parameters.json   （環境ごと）
+Parameters:
+  ProjectName:
+    Type: String
+    # CI Deployで、CI StackのProjectNameを実行時に上書きします（JSONには書きません）。
+    # IAM RoleのPathに使い、Bootstrap StackのExecution Roleが操作できる範囲を決めます。
+    Default: ''
+  Environment:
+    Type: String
+    Default: dev
+    # 許可する値を限定します。想定外の文字列はデプロイ前に弾かれます。
+    AllowedValues: [dev, stg, prod]
+  LogRetentionDays:
+    Type: Number
+    # 3つの関数すべてのLog Groupに同じ保持日数を適用します。
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+  AlarmTopicArn:
+    Type: String
+    # 空文字が既定。CI Deployでは通知用SNS TopicのARNを実行時に上書きします。
+    Default: ''
+    Description: SNS topic ARN for alarm notifications. Empty disables notification.
+  ScheduleExpression:
+    Type: String
+    # ジョブ全体の実行間隔です。関数ごとではなく、State Machineの起動間隔を決めます。
+    Default: rate(1 day)
+    Description: EventBridge Scheduler expression, for example cron(0 4 * * ? *).
+  ScheduleState:
+    Type: String
+    # 構築直後の意図しない実行を避けるため、既定は停止状態です。
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+  ScheduleTimezone:
+    Type: String
+    # cron式の解釈に使うIANA Time Zone。
+    Default: Asia/Tokyo
+
+Conditions:
+  # AlarmTopicArnが空文字でなければ真。「通知先が指定されているか」の判定に使います。
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # CodeDeployがlive Aliasの切替に使うRole。3つのLambdaで共用します。
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-codedeploy'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda'
+
+  # ---------------------------------------------------------------------------
+  # 1番目: 処理対象を集める
+  # ---------------------------------------------------------------------------
+  # ステップごとに Log Group・実行Role・Lambda関数 の3つを作ります。
+  # この3つの組み合わせは、2番目・3番目も同じ形です。違うのは名前とCodeUriだけです。
+
+  # ログの出力先。Lambdaに自動作成させず、Templateで管理します。
+  # 保持期間をParameterで制御でき、Stackの状態としても追跡できるためです。
+  FetchLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # この関数が実行中に使うRole。与える権限は自分のLog Groupへの書き込みだけです。
+  # ステップごとにRoleを分けるため、あとから特定のステップにだけ権限を足せます。
+  FetchExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # 名前は <Stack名>-<ステップ名>-execution です。ステップ名で見分けられます。
+      RoleName: !Sub '${AWS::StackName}-fetch-execution'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt FetchLogGroup.Arn
+
+  # 1番目のLambda。State Machineが最初に呼び出します。
+  # 単独Lambdaの構成と同じく、Version発行とlive Aliasでの切替を行います。
+  Fetch:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fetch'
+      # 一覧で役割が分かるようにします。Descriptionは関数の設定の一部のため、
+      # 変更すると新しいVersionが発行されます。
+      Description: ジョブの1番目。処理の対象を集めます。
+      # ステップごとに関数のディレクトリを分けます。ここがステップ間の唯一の違いです。
+      CodeUri: ../../../application/functions/sample_flow_a/fetch/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt FetchExecutionRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref FetchLogGroup
+      # デプロイのたびにVersionを発行し、live Aliasの向き先を切り替えます。
+      # State Machineはこのliveを呼ぶため、切替の単位がステップごとに明確になります。
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: AllAtOnce
+        Role: !GetAtt CodeDeployRole.Arn
+        # ここではAlarmを関連付けません。ジョブ単位の失敗Alarm（JobFailedAlarm）は
+        # State Machineに依存し、State MachineはこのLambdaのAliasに依存するため、
+        # 切替の判定に使うと循環参照になり、CloudFormationが拒否します。
+        # 影響は infrastructure/README.md の「ジョブで自動Rollbackを設定しない理由」にあります。
+
+  # ---------------------------------------------------------------------------
+  # 2番目: 集めた対象を加工する
+  # ---------------------------------------------------------------------------
+  # 構成は1番目と同じです。違うのは名前（transform）とCodeUriだけです。
+
+  TransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  TransformExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-transform-execution'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TransformLogGroup.Arn
+
+  Transform:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-transform'
+      # 一覧で役割が分かるようにします。Descriptionは関数の設定の一部のため、
+      # 変更すると新しいVersionが発行されます。
+      Description: ジョブの2番目。集めた対象を加工します。
+      CodeUri: ../../../application/functions/sample_flow_a/transform/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt TransformExecutionRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref TransformLogGroup
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: AllAtOnce
+        Role: !GetAtt CodeDeployRole.Arn
+        # ここではAlarmを関連付けません。ジョブ単位の失敗Alarm（JobFailedAlarm）は
+        # State Machineに依存し、State MachineはこのLambdaのAliasに依存するため、
+        # 切替の判定に使うと循環参照になり、CloudFormationが拒否します。
+        # 影響は infrastructure/README.md の「ジョブで自動Rollbackを設定しない理由」にあります。
+
+  # ---------------------------------------------------------------------------
+  # 3番目: 結果を記録して締めくくる
+  # ---------------------------------------------------------------------------
+  # 構成は1番目と同じです。違うのは名前（notify）とCodeUriだけです。
+
+  NotifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  NotifyExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-notify-execution'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt NotifyLogGroup.Arn
+
+  Notify:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-notify'
+      # 一覧で役割が分かるようにします。Descriptionは関数の設定の一部のため、
+      # 変更すると新しいVersionが発行されます。
+      Description: ジョブの3番目。結果を記録して締めくくります。
+      CodeUri: ../../../application/functions/sample_flow_a/notify/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt NotifyExecutionRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref NotifyLogGroup
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: AllAtOnce
+        Role: !GetAtt CodeDeployRole.Arn
+        # ここではAlarmを関連付けません。ジョブ単位の失敗Alarm（JobFailedAlarm）は
+        # State Machineに依存し、State MachineはこのLambdaのAliasに依存するため、
+        # 切替の判定に使うと循環参照になり、CloudFormationが拒否します。
+        # 影響は infrastructure/README.md の「ジョブで自動Rollbackを設定しない理由」にあります。
+
+  # ---------------------------------------------------------------------------
+  # ジョブの流れ（Step Functions）
+  # ---------------------------------------------------------------------------
+
+  # State Machineが各Lambdaを呼び出すために引き受けるRole。
+  # 呼べるのは、このStackの3つのLambdaのlive Aliasだけです。
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-states'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+            # 自分のAccountの、このState Machineからの利用だけに限定します。
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeJobSteps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Ref FetchAliaslive
+                  - !Ref TransformAliaslive
+                  - !Ref NotifyAliaslive
+
+  # ジョブの流れ本体。3つのステップを順に実行します。
+  # 一時的な失敗に備えて、各ステップで2回まで再試行します（5秒間隔、待ち時間は倍々）。
+  # 再試行しても失敗した場合はジョブ全体が失敗し、以降のステップは実行されません。
+  # どこまで進んだか、どのステップで失敗したかは、Step Functionsの実行履歴で確認できます。
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}'
+      RoleArn: !GetAtt StateMachineRole.Arn
+      # 定義（下のJSON）の中の ${FetchAlias} などを、実際のARNへ置き換えます。
+      # JSONへ直接ARNを書けないため、この対応表で渡します。
+      # FetchAliaslive は、AutoPublishAlias: live からSAMが自動生成するAliasの論理IDです
+      # （<関数の論理ID> + Alias + <Alias名>）。
+      DefinitionSubstitutions:
+        FetchAlias: !Ref FetchAliaslive
+        TransformAlias: !Ref TransformAliaslive
+        NotifyAlias: !Ref NotifyAliaslive
+      # ジョブの流れをAmazon States Language（JSON）で書きます。
+      #   Type: Task    … Lambdaを1つ呼ぶステップ
+      #   Resource      … 呼び出す先。ここではlive AliasのARN
+      #   Retry         … 失敗時の再試行。ErrorEqualsに挙げた種類だけが対象
+      #   Next / End    … 次のステップ、または終了
+      # 前のステップの戻り値が、そのまま次のステップの入力になります。
+      DefinitionString: |
+        {
+          "Comment": "Fetch, transform, then notify.",
+          "StartAt": "Fetch",
+          "States": {
+            "Fetch": {
+              "Type": "Task",
+              "Resource": "${FetchAlias}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "Transform"
+            },
+            "Transform": {
+              "Type": "Task",
+              "Resource": "${TransformAlias}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Next": "Notify"
+            },
+            "Notify": {
+              "Type": "Task",
+              "Resource": "${NotifyAlias}",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+
+  # ---------------------------------------------------------------------------
+  # 定期実行と監視
+  # ---------------------------------------------------------------------------
+
+  # EventBridge SchedulerがState Machineを開始するために引き受けるRole。
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default'
+      Policies:
+        - PolicyName: StartJob
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+
+  # 定期実行。起動先は個々のLambdaではなくState Machineです。
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}'
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref ScheduleState
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref StateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 300
+
+  # ジョブ単位の失敗検知。どのステップで落ちても1件の通知になります。
+  # ステップごとのAlarmは作りません。失敗箇所は実行履歴で特定します。
+  JobFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-failed'
+      AlarmDescription: At least one failed execution of this job.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref StateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+# デプロイ後に参照する値。マネジメントコンソールやCLIから確認できます。
+# Log Group名はCloudFormationが生成するため、ステップごとにここで確認します。
+Outputs:
+  StateMachineArn:
+    # 手動でジョブを動かすときは、このARNに対して実行を開始します。
+    Description: Start this state machine to run the job.
+    Value: !Ref StateMachine
+  ScheduleName:
+    Description: EventBridge Scheduler schedule that starts the job.
+    Value: !Ref Schedule
+  JobFailedAlarmName:
+    Description: Alarm that fires when an execution of this job fails.
+    Value: !Ref JobFailedAlarm
+  FetchLogGroupName:
+    Description: Log group of the first step.
+    Value: !Ref FetchLogGroup
+  TransformLogGroupName:
+    Description: Log group of the second step.
+    Value: !Ref TransformLogGroup
+  NotifyLogGroupName:
+    Description: Log group of the third step.
+    Value: !Ref NotifyLogGroup

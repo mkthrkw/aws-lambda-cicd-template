@@ -1,0 +1,273 @@
+# Runtime Stack Template（SAM）: キューに届いたメッセージをLambdaが処理する
+#
+# 1 Runtime Stackは1つのデプロイ単位です。この例では、受け口のSQS Queueと、
+# 失敗したメッセージの退避先（DLQ）、処理するLambdaをまとめて管理します。
+# 時刻で動く例は sample-batch-a/、複数のLambdaで1つのジョブを組む例は sample-flow-a/ にあります。
+#
+# 処理の流れ
+#   送信元 ──> Queue ──(Event Source Mapping)──> Lambda live Alias ──> Log Group
+#                │                                      │
+#                └── 3回失敗したメッセージ ──> DLQ ──> DLQ Alarm ──> CI StackのSNS Topic
+#
+# 失敗したメッセージだけがキューへ戻ります（部分失敗の報告）。この動きは、
+# 下の FunctionResponseTypes と、handler.pyの戻り値の両方がそろって働きます。
+#
+# 別のキュー処理を作るときは、このディレクトリをコピーし、CodeUriを変更します。
+# 論理IDやResource名にRuntime名を書かないため、ほかの箇所は変更不要です。
+#
+# Resource名は、Stack名 <ProjectName>-<Environment>-<Runtime名> を土台に付けます。
+# 例: <Stack名>（Queue・関数）、<Stack名>-dlq。名前の長さの上限は
+# infrastructure/tests/test_resource_names.py で確認します。
+#
+# IAM Roleには /<ProjectName>/<Environment>/runtime/ のPathを付けます。
+# Log Groupだけは、Stack削除後も残す設定のため名前を固定しません。
+#
+# Tag（Project / Environment / ManagedBy）はTemplateに書きません。Deploy Stageの sam deploy が
+# Stackへ付け、CloudFormationが各Resourceへ伝播させます。Runtimeを追加しても同じTagが付きます。
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: One SQS queue with a dead letter queue and a Lambda consumer on a live alias.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ''
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, stg, prod]
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: SNS topic ARN for alarm notifications. Empty disables notification.
+  BatchSize:
+    Type: Number
+    Default: 10
+    # 1回の呼び出しで受け取るメッセージの最大件数です。増やすと呼び出し回数が減り、
+    # 1回あたりの処理時間が伸びます。Timeoutとあわせて調整します。
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of messages passed to one invocation.
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    # 同じメッセージが何回処理に失敗したらDLQへ移すかです。
+    # 1にすると1回の失敗で退避し、大きくすると再試行が増えます。
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of failed deliveries before a message moves to the dead letter queue.
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # 受け口と、失敗したメッセージの退避先
+  # ---------------------------------------------------------------------------
+
+  # 3回（MaxReceiveCount）処理に失敗したメッセージが移る先です。
+  # 失われると原因を追えないため、保持期間はSQSの上限（14日）にしています。
+  # Queueより先に定義します。QueueがこのDLQのARNを参照するためです。
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      # SQSが管理する鍵で保管時に暗号化します。KMSの鍵を自分で用意する必要はありません。
+      SqsManagedSseEnabled: true
+
+  # 処理の受け口。送信元はこのQueueへメッセージを送ります。
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}'
+      # 取り出したメッセージが他から見えなくなる時間です。この間に処理を終えられないと、
+      # 同じメッセージがもう一度配信されます。AWSはLambdaのTimeoutの6倍を推奨しています。
+      # Timeout（30秒）を変える場合は、この値も合わせて見直してください。
+      VisibilityTimeout: 180
+      # 処理されないまま保持する期間（4日）。これを過ぎたメッセージは消えます。
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      # 失敗が続いたメッセージをDLQへ移す設定です。これが無いと、
+      # 処理できないメッセージが保持期間いっぱい再試行され続けます。
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  # ---------------------------------------------------------------------------
+  # メッセージを処理するLambda
+  # ---------------------------------------------------------------------------
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-execution'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+        # Lambdaサービスは、この関数のRoleの権限でキューからメッセージを取り出します。
+        # 取り出す（Receive）、処理後に消す（Delete）、件数などを見る（GetQueueAttributes）の
+        # 3つが必要です。送信（SendMessage）は行わないため許可しません。
+        - PolicyName: ReceiveQueueMessages
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt Queue.Arn
+
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}'
+      # 一覧で役割が分かるようにします。Descriptionは関数の設定の一部のため、
+      # 変更すると新しいVersionが発行されます。
+      Description: キューのサンプル。届いたメッセージを1件ずつ処理します。
+      CodeUri: ../../../application/functions/sample_queue_a/
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt ExecutionRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref LogGroup
+      AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
+      DeploymentPreference:
+        Type: AllAtOnce
+        Role: !GetAtt CodeDeployRole.Arn
+        Alarms:
+          - !Ref ErrorsAlarm
+      # キューと関数の接続です。SAMがAWS::Lambda::EventSourceMappingを作ります。
+      # 起動元はこの接続だけで、Schedulerは使いません。
+      Events:
+        QueueMessages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt Queue.Arn
+            BatchSize: !Ref BatchSize
+            # 失敗したメッセージだけをキューへ戻す指定です。handler.pyが返す
+            # batchItemFailures と対になっています。片方だけでは働きません。
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-codedeploy'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda'
+
+  # ---------------------------------------------------------------------------
+  # 監視
+  # ---------------------------------------------------------------------------
+
+  # 処理の失敗。live Alias経由の呼び出しで1件でもエラーが出たら発報します。
+  # 1件の失敗はDLQへ移る前の段階のため、再試行で解決することもあります。
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: At least one failed invocation through the live alias.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+        - Name: Resource
+          Value: !Sub '${Function}:live'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # 処理しきれなかったメッセージの検知。DLQに1件でも入ったら発報します。
+  # 再試行を使い切った＝人が原因を見る必要がある状態です。
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq'
+      AlarmDescription: At least one message moved to the dead letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      # 最大値で見ます。平均にすると、少数のメッセージが薄まって見落とすためです。
+      Statistic: Maximum
+      # SQSのメトリクスは5分間隔で届きます。Periodを短くしても検知は早くなりません。
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+Outputs:
+  QueueUrl:
+    Description: Send messages here; the URL is used by aws sqs send-message.
+    Value: !Ref Queue
+  DeadLetterQueueUrl:
+    Description: Messages that failed MaxReceiveCount times are stored here.
+    Value: !Ref DeadLetterQueue
+  FunctionName:
+    Description: Lambda function name (same as the stack name); invoked through the live alias.
+    Value: !Ref Function
+  LiveAliasArn:
+    Description: The event source mapping points at this alias.
+    Value: !Ref FunctionAliaslive
+  LogGroupName:
+    Description: Log group of this function; the name is generated by CloudFormation.
+    Value: !Ref LogGroup
+  ErrorsAlarmName:
+    Description: Alarm that fires on a failed invocation; also gates the alias switch.
+    Value: !Ref ErrorsAlarm
+  DeadLetterAlarmName:
+    Description: Alarm that fires when a message reaches the dead letter queue.
+    Value: !Ref DeadLetterAlarm

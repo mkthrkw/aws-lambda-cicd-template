@@ -1,0 +1,344 @@
+# Bootstrap Stack Template
+#
+# Runtime Stack（Lambda 1つ分のStack）を配備するための土台を作ります。
+#
+# このStackが作るもの
+#   - Deployment Bucket: sam deploy がLambdaのコードZIPとTemplateをアップロードするS3 Bucket
+#   - Execution Role: CloudFormationがRuntime StackのResourceを作成・更新するときに使うIAM Role
+#
+# 環境（dev / stg / prod）ごとに、管理者がCloudShellから最初に1回作成します。
+# 作成順は Bootstrap → CI です。CI StackはこのStackのExport（Outputs）を取り込みます。
+# PipelineはこのStackを更新しません。権限を変えるときは管理者が手動で更新します。
+#
+# なぜExecution Roleを分けるのか
+#   Pipeline（CI StackのDeploy Role）にLambdaやIAM Roleを直接作る権限を持たせず、
+#   「Runtime Stackに必要な操作だけ」を許可したこのRoleをCloudFormationに使わせるためです。
+#
+#   CI StackのDeploy Role ──sam deploy --role-arn──> CloudFormation ──このRoleで──> Lambda等を作成
+#
+# Tag（Project / Environment / ManagedBy）はTemplateに書きません。Stackを作成・更新する
+# コマンドに --tags で指定し、CloudFormationが各Resourceへ伝播させます（README.mdの構築手順）。
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation execution role and SAM deployment bucket for project Runtime stacks.
+
+# Stack作成時に渡す値。infrastructure/env/<環境>/setup-parameters.json にまとめています。
+Parameters:
+  # Stack名やResource名の先頭に付く名前。CI Stackと同じ値にします。
+  # Resource名が長くなりすぎないよう、20文字までにしています。
+  ProjectName:
+    Type: String
+    Description: Lowercase project prefix shared by Bootstrap, CI, and Runtime stacks.
+    MinLength: 1
+    MaxLength: 20
+    AllowedPattern: '^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$'
+    ConstraintDescription: Use lowercase letters, numbers, and single hyphens; start with a letter.
+  # 環境の識別子。Stack名やResource名に入り、環境ごとに別のStackとして作られます。
+  # dev / stg / prodはそれぞれ別のAWS Accountに作る前提です。
+  Environment:
+    Type: String
+    Description: Deployment environment managed in this AWS account.
+    AllowedValues: [dev, stg, prod]
+
+Resources:
+  # SAMがRuntime Stackの資材（コードのZIPとTemplate）をアップロードするBucketです。
+  # 読むのはこのStackのExecution Roleなので、Roleと同じStackで作ります。
+  # 同じTemplate内なら、Roleの権限にこのBucketのARNを直接書けます。
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    # Stackを削除してもBucketは残します。中身が残ったBucketはCloudFormationで削除できず、
+    # Stackの削除自体が失敗するためです。不要になったら手動で空にして削除します。
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Bucket名は固定せず、Account内の衝突をCloudFormationに回避させます。
+      # 生成名は <Stack名>-<論理ID>-<乱数> です。S3の上限63文字で途中が切れないよう、
+      # 論理IDを短くし、ProjectNameを20文字までにしています。
+      # 暗号化・所有者の強制・公開アクセスのブロックで、Bucketを非公開に保ちます。
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: alias/aws/s3
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Lambdaは配備時にコードを取り込むため、資材を消しても配備済みのLambdaは動き続けます。
+          # 古い資材が溜まり続けないよう、期限で削除します。
+          - Id: ExpireRuntimeArtifacts
+            Status: Enabled
+            Prefix: runtimes/
+            ExpirationInDays: 180
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          # 途中で止まったアップロードの断片は課金対象のため、7日で片付けます。
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # HTTPS以外（暗号化されていない通信）でのアクセスをすべて拒否します。
+  # 読み書きの許可はRole側（このStackのExecution Role、CI StackのDeploy Role）に書きます。
+  DeployBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeployBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt DeployBucket.Arn
+              - !Sub '${DeployBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # CloudFormation Execution Role
+  # CloudFormationがRuntime StackのResource（Lambda、IAM Role、Alarm等）を作成・更新するときに
+  # 引き受けるRoleです。Lambdaが実行時に使うRole（Runtime TemplateのExecutionRole）とは別物です。
+  #
+  # 一度Runtime Stackに関連付けると、Stackの更新や削除でもこのRoleが使われます。
+  # そのため、Runtime Stackを削除し終えるまで、このStackを削除しないでください。
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Role名は固定せず、CloudFormationが <Stack名>-<論理ID>-<乱数> の形で生成します。
+      # IAM Role名の上限64文字で途中が切れないよう、論理IDを短くしています。
+      # Pathで用途を分け、Runtime Stackが操作できる /runtime/ のRoleと区別します。
+      Path: !Sub '/${ProjectName}/${Environment}/cloudformation/'
+      # このRoleを引き受けられるのはCloudFormationだけです。
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFormationOnly
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      # Runtime Templateが作るResourceだけを操作できるようにします。
+      # 多くのStatementは、Resource名が <ProjectName>-<Environment>- で始まるものに限定しています。
+      # Runtime TemplateはStack名 <ProjectName>-<Environment>-<Runtime名> を土台に名前を付けるためです。
+      Policies:
+        - PolicyName: ManageRuntimeStackResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormationがSAM Templateを通常のCloudFormation Templateへ変換する権限です。
+              # Runtime Stackの作成前にAWS管理のServerless Transformを呼び出します。
+              - Sid: UseServerlessTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31'
+
+              # SAMが生成するFunction、Version、Aliasを、Runtime Stack由来名に限定します。
+              - Sid: ManageRuntimeLambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateAlias
+                  - lambda:CreateFunction
+                  - lambda:DeleteAlias
+                  - lambda:DeleteFunction
+                  - lambda:GetAlias
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListVersionsByFunction
+                  - lambda:PublishVersion
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:UpdateAlias
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-*'
+
+              # Runtime StackのLambda、Scheduler、CodeDeploy用のRoleだけを管理します。
+              # 範囲はRole名ではなくPathで決めます。このRole自身（/cloudformation/）と
+              # CI StackのRole（/ci/）は範囲外のため、Runtime Templateから権限を変更できません。
+              - Sid: ManageRuntimeRoles
+                Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:UpdateRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}/${Environment}/runtime/*'
+
+              # CloudFormationは名前（RoleName）を指定したRoleを作る前に、同名のRoleが無いかを
+              # iam:GetRoleで確認します。まだ存在しないRoleにはPathが無いため、この確認は
+              # Pathを含まないARN（role/<Role名>）で判定され、上のStatementでは拒否されます（実環境で確認）。
+              # Inline Policyの作成前にも同じ確認（iam:GetRolePolicy）が行われます。
+              # この確認を通すため、Runtime Roleの名前の範囲に限って読み取りだけを許可します。
+              - Sid: CheckRuntimeRoleNames
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-${Environment}-*'
+
+              # Roleを各サービスへ渡す操作は、上記Roleと3サービスの組合せだけを許可します。
+              - Sid: PassRuntimeRolesToServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}/${Environment}/runtime/*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - scheduler.amazonaws.com
+                      - codedeploy.amazonaws.com
+                      - states.amazonaws.com
+
+              # Runtime StackのLog Group。名前はCloudFormationが <Stack名>-LogGroup-<乱数> で付けます。
+              #
+              # ここから下の5サービス（Logs、CloudWatch、CodeDeploy、Step Functions、Scheduler）は、
+              # Actionを1つずつ並べず、そのサービスの操作全体を許可します。範囲はResourceで決め、
+              # このProjectとEnvironmentが作るResourceだけに限定します。
+              # 設定項目を1つ足すたびにBootstrap Stackの更新が必要になる状態を避けるためです。
+              # 権限の広さを決めているのはResourceの限定です。判断の根拠は infrastructure/README.md にあります。
+              # LambdaとIAMは影響が大きいため、この方式にせずActionを列挙します。
+              - Sid: ManageRuntimeLogGroups
+                Effect: Allow
+                Action: logs:*
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ProjectName}-${Environment}-*'
+
+              # DescribeLogGroupsはResource ARNによる限定に対応しません。
+              - Sid: ReadLogGroupInventory
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+
+              # Lambdaのエラーや処理時間を監視するAlarm
+              - Sid: ManageRuntimeAlarms
+                Effect: Allow
+                Action: cloudwatch:*
+                Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-${Environment}-*'
+
+              # SAMは、Lambdaの新しいVersionへliveを切り替えるためにCodeDeployのResourceを作ります。
+              # 2つ目のVersionへ切り替えるとき、CloudFormationは切替内容（リビジョン）を
+              # CodeDeployへ登録してから配信します。初回作成では切替が無いため登録も起きません。
+              - Sid: ManageRuntimeCodeDeployResources
+                Effect: Allow
+                Action: codedeploy:*
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ProjectName}-${Environment}-*'
+                  - !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ProjectName}-${Environment}-*/*'
+
+              # 切替方式（AllAtOnce: 一括切替）の定義を読み取ります。AWSが用意する定義なので名前は固定です。
+              - Sid: ReadLambdaDeploymentConfiguration
+                Effect: Allow
+                Action: codedeploy:GetDeploymentConfig
+                Resource: !Sub 'arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentconfig:CodeDeployDefault.LambdaAllAtOnce'
+
+              # Lambda AliasのUpdatePolicyでCloudFormationとCodeDeployを連携する権限です。
+              # このActionはResource ARNによる限定に対応しません。
+              - Sid: RunCloudFormationCodeDeployUpdate
+                Effect: Allow
+                Action: codedeploy:CreateCloudFormationDeployment
+                Resource: '*'
+
+              # 複数のLambdaを順に実行するジョブで使うStep FunctionsのState Machineです。
+              # 実行ログのCloudWatch Logsへの出力は初期構成では使いません。
+              # 有効にするには、Resourceを限定できないlogs:CreateLogDelivery等が必要になるためです。
+              # 実行の経過はStep Functionsの実行履歴から確認できます。
+              - Sid: ManageRuntimeStateMachines
+                Effect: Allow
+                Action: states:*
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-${Environment}-*'
+
+              # Lambdaを定期実行するEventBridge Scheduler
+              - Sid: ManageRuntimeSchedules
+                Effect: Allow
+                Action: scheduler:*
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/${ProjectName}-${Environment}-*'
+
+              # Stack TagはEvent Source Mappingにも伝播します。MappingのIDは作成時に決まるため、
+              # AWSはこの確認を event-source-mapping:* に対して行います（実環境で確認）。
+              # ARNで範囲を絞れないため、Tagの読み書きだけを別のStatementで許可します。
+              # 権限が無いと、Mappingの作成が UnauthorizedTaggingOperation で失敗します。
+              - Sid: TagRuntimeEventSourceMappings
+                Effect: Allow
+                Action:
+                  - lambda:ListTags
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*'
+
+              # メッセージを受け取るRuntimeが使うSQS Queue（本体とDLQ）です。
+              # Service単位（sqs:*）にはしません。メッセージの送信・受信・削除まで
+              # 許可することになり、配備のRoleに業務データを操作する権限が付くためです。
+              # ここではQueueそのものを作る・消す・設定を変える操作だけを許可します。
+              - Sid: ManageRuntimeQueues
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ListQueueTags
+                  - sqs:SetQueueAttributes
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-*'
+
+              # QueueとLambdaを繋ぐEvent Source Mappingです。Mappingには乱数のIDが付き、
+              # ARNで範囲を決められません。代わりに、接続先の関数をConditionで限定します。
+              - Sid: ManageRuntimeEventSourceMappings
+                Effect: Allow
+                Action:
+                  - lambda:CreateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    lambda:FunctionArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-*'
+
+              # LambdaはCloudFormationが引き受けるこのRoleの権限で、コードのZIPをS3から取得します。
+              # 対象は同じStackのDeployment Bucketの runtimes/ だけで、書き込みは許可しません。
+              - Sid: ReadRuntimeArtifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${DeployBucket.Arn}/runtimes/*'
+
+# CI Stackへ渡す値。Exportした値は、他のStackから Fn::ImportValue で参照できます。
+Outputs:
+  RuntimeExecutionRoleArn:
+    # CI StackがFn::ImportValueで参照します。ARNを人が転記する必要はありません。
+    # Exportされている間、この出力の変更とStackの削除はできません。
+    # CI Stackを先に削除してからBootstrap Stackを削除します。
+    Description: Imported by the CI Stack. Do not copy this ARN into files or parameters.
+    Value: !GetAtt ExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-bootstrap-RuntimeExecutionRoleArn'
+  # SAM資材（コードのZIPとTemplate）の置き場所です。
+  DeploymentBucketName:
+    # CI StackがFn::ImportValueで取り込み、Deploy ProjectのDEPLOYMENT_BUCKETとDeploy Roleの権限に使います。
+    Description: Imported by the CI Stack as the SAM upload destination.
+    Value: !Ref DeployBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-bootstrap-DeploymentBucketName'

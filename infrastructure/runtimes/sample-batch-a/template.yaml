@@ -1,0 +1,322 @@
+# Runtime Stack Template（SAM）
+#
+# 1 Runtime Stackは1つのデプロイ単位です。この例は最も単純な形で、1つの関数に加えて
+# 定期実行のScheduler、Log Group、実行Role、Alarmまでを1つのStackで管理します。
+# 複数のLambdaで1つのジョブを組む例は sample-flow-a/、キューで動く例は sample-queue-a/ にあります。
+# 設計の背景は infrastructure/README.md を参照してください。
+#
+# このStackが作るもの
+#   - Lambda関数と、SAMが自動で作るVersion・live Alias・CodeDeployのResource
+#   - Lambda実行Role / CodeDeploy Role / Scheduler Role
+#   - Log Group、Errors / Duration Alarm、EventBridge Scheduler
+#
+# 定期実行の流れ
+#   EventBridge Scheduler ──(Scheduler Role)──> Lambda live Alias ──> Log Group
+#                                                      │
+#                                   Errors / Duration Alarm ──> CI StackのSNS Topic
+#
+# 配備はPipelineのDeploy Stageが `sam deploy` で行います。StackのResourceを実際に作るのは、
+# Bootstrap StackのExecution Role（CloudFormation用のRole）です。
+#
+# 別のRuntimeを作るときは、このディレクトリをコピーし、CodeUriだけを変更します。
+# 論理IDやResource名にRuntime名を書かないため、ほかの箇所は変更不要です。
+#
+# Parameterの値はこのTemplateのDefaultを土台に、以下のJSONで上書きされます。
+#   infrastructure/runtimes/<Runtime名>/parameters.json（Runtime共通）
+#   infrastructure/env/<環境>/runtime-parameters.json   （環境ごと）
+#
+# Resource名は、Stack名 <ProjectName>-<Environment>-<Runtime名> を土台に付けます。
+# Bootstrap StackのExecution Roleは、この名前で始まるLambda・Alarm・Scheduleだけを操作できるためです。
+# Log Groupだけは、Stack削除後も残す設定のため、名前を固定せず自動生成に任せます。
+#
+# IAM Roleには /<ProjectName>/<Environment>/runtime/ のPathを付けます。
+# Bootstrap StackのExecution Roleは、名前ではなくこのPathでRoleを限定しています。
+
+# Templateの書式バージョン。CloudFormationでは現在この値で固定です。
+#
+# Tag（Project / Environment / ManagedBy）はTemplateに書きません。Deploy Stageの sam deploy が
+# Stackへ付け、CloudFormationが各Resourceへ伝播させます。Runtimeを追加しても同じTagが付きます。
+AWSTemplateFormatVersion: '2010-09-09'
+# SAMの変換を有効にする宣言。これがあるため AWS::Serverless::* を書けます。
+# デプロイ時にSAMが通常のCloudFormation Resourceへ展開します。
+Transform: AWS::Serverless-2016-10-31
+Description: One scheduled Lambda with a live alias and SAM-managed deployment.
+
+# デプロイ時に外から渡す設定値。型はStringとNumberのみ使用します。
+Parameters:
+  ProjectName:
+    Type: String
+    # CI Deployで、CI StackのProjectNameを実行時に上書きします（JSONには書きません）。
+    # IAM RoleのPathに使い、Bootstrap StackのExecution Roleが操作できる範囲を決めます。
+    Default: ''
+  Environment:
+    Type: String
+    Default: dev
+    # 許可する値を限定します。想定外の文字列はデプロイ前に弾かれます。
+    AllowedValues: [dev, stg, prod]
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    # CloudWatch Logsが受け付ける保持日数のうち、利用するものだけを並べています。
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+  AlarmTopicArn:
+    Type: String
+    # 空文字が既定。通知先を用意していない環境でもデプロイできるようにするためです。
+    # CI Deployでは、CI Stackが作成したSNS TopicのARNを実行時に上書きします。
+    Default: ''
+    Description: SNS topic ARN for alarm notifications. Empty disables notification.
+  ScheduleExpression:
+    Type: String
+    # `rate(...)`または`cron(...)`形式で指定します。Runtimeごとに設定します。
+    Default: rate(1 day)
+    Description: EventBridge Scheduler expression, for example cron(0 3 * * ? *).
+  ScheduleState:
+    Type: String
+    # 構築直後の意図しない実行を避けるため、既定は停止状態です。
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+  ScheduleTimezone:
+    Type: String
+    # cron式の解釈に使うIANA Time Zone。
+    Default: Asia/Tokyo
+
+# 条件付きで設定を切り替えるための宣言。
+Conditions:
+  # AlarmTopicArnが空文字でなければ真。「通知先が指定されているか」の判定に使います。
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # ログの出力先。Lambdaに自動作成させず、Templateで明示的に管理します。
+  # 保持期間をParameterで制御でき、Stackの状態としても追跡できるためです。
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    # Stackを削除してもLog Groupは残します（障害調査用のログを失わないため）。
+    DeletionPolicy: Retain
+    # 置換を伴う更新が起きた場合も、古いLog Groupを削除せずに残します。
+    UpdateReplacePolicy: Retain
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda関数が実行中に使うIAM Role（Lambda実行Role）。
+  # Bootstrap StackのExecution Role（CloudFormationがResourceを作るときに使うRole）とは別物です。
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-execution'
+      # ARNは arn:aws:iam::<Account>:role/<ProjectName>/<Environment>/runtime/<RoleName> になります。
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      # 「このRoleを誰が引き受けられるか」の定義。ここではLambdaサービスだけです。
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # 与える権限は、上で作った自分のLog Groupへの書き込みだけに絞ります（最小権限）。
+      # AWS管理ポリシーを使わないのは、他のLog Groupへの書き込みまで許さないためです。
+      Policies:
+        - PolicyName: WriteFunctionLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                # !GetAtt は他Resourceの属性（ここではARN）を取り出す組込み関数です。
+                Resource: !GetAtt LogGroup.Arn
+
+  # Lambda関数本体。SAMが関数・Version・Alias・CodeDeploy関連をまとめて生成します。
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}'
+      # 一覧で役割が分かるようにします。Descriptionは関数の設定の一部のため、
+      # 変更すると新しいVersionが発行されます。
+      Description: 定期実行のサンプル。1回の実行をログへ記録します。
+      # このTemplateから見た相対パス。この配下のコードと依存をSAMがビルドします。
+      # Runtimeごとに変える唯一の箇所です。
+      # 共有コード（application/common）はビルド後にdeployment/scripts/build.pyが同梱します。
+      CodeUri: ../../../application/functions/sample_batch_a/
+      # 「ファイル名.関数名」の形式で入口を指定します。
+      Handler: handler.lambda_handler
+      # 実行環境とCPUアーキテクチャ。環境で変えず固定値にします。
+      Runtime: python3.12
+      Architectures: [x86_64]
+      MemorySize: 128
+      Timeout: 30
+      # 上で定義したRoleを明示的に使います（SAMの自動生成Roleは使いません）。
+      Role: !GetAtt ExecutionRole.Arn
+      # 既定の /aws/lambda/<関数名> ではなく、Templateで管理するLog Groupへ出力します。
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref LogGroup
+      # デプロイのたびにVersionを発行し、live Aliasの向き先を切り替えます。
+      # 呼び出し側はこのAliasを指すため、切替の単位が明確になります。
+      AutoPublishAlias: live
+      # 既定ではコードやMemorySize等の変更しかVersion発行の対象になりません。
+      # trueにすると、Timeout等の設定変更もliveへ反映されます。
+      AutoPublishAliasAllProperties: true
+      # CodeDeployによる切替方式。AllAtOnceは一括切替です。
+      DeploymentPreference:
+        Type: AllAtOnce
+        # 切替に使うRoleを自分で定義します。SAMに任せるとPathの無いRoleが作られ、
+        # Bootstrap StackのExecution Roleでは作成できないためです。中身はSAMの既定と同じです。
+        Role: !GetAtt CodeDeployRole.Arn
+        # 切替中にこのAlarmが発報すると、CodeDeployが自動でRollbackします。
+        # Alarmを作るだけでは連携されないため、ここで明示的に関連付けます。
+        # 一時的な遅延で切戻さないよう、Duration Alarmは判定に含めません。
+        Alarms:
+          - !Ref ErrorsAlarm
+
+  # CodeDeployがlive Aliasの参照先を新しいVersionへ切り替えるときに引き受けるRole。
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-codedeploy'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      # SAMがDeploymentPreferenceのために自動生成するRoleと同じAWS管理ポリシーです。
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda'
+
+  # EventBridge SchedulerがLambdaを呼び出すために引き受けるRole。
+  # Schedulerは自分自身の権限ではなく、このRoleの権限でLambdaを呼び出します。
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler'
+      Path: !Sub '/${ProjectName}/${Environment}/runtime/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            # 自分のAccountの、既定Schedule Group内のSchedulerだけに限定します。
+            # 他者が作ったSchedulerからこのRoleを使われることを防ぎます。
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/default'
+      # 呼び出せるのは、この関数のlive Aliasだけです。
+      # 未修飾ARNやVersion直接の呼び出しは許可しません。
+      Policies:
+        - PolicyName: InvokeLiveAlias
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Ref FunctionAliaslive
+
+  # 定期実行の設定。Lambdaの起動元はこのSchedulerだけです。
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}'
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: !Ref ScheduleTimezone
+      State: !Ref ScheduleState
+      # 指定時刻からのずらし実行を許可せず、設定どおりの時刻に実行します。
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        # 呼び出し先はlive Aliasです。CodeDeployの切替対象と一致します。
+        Arn: !Ref FunctionAliaslive
+        RoleArn: !GetAtt SchedulerRole.Arn
+        # 入力は固定の空JSONです。関数は入力を参照しません。
+        Input: '{}'
+        # 配信の再試行。重複実行を避けたい処理では0回に変更してください。
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 300
+
+  # 失敗の検知。live Alias経由の呼び出しで1件でもエラーが出たら発報します。
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: At least one failed invocation through the live alias.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      # Dimensionsで監視対象を絞ります。Resourceに「関数名:live」を指定することで、
+      # Alias経由の呼び出しだけを対象にできます。
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+        - Name: Resource
+          # !Sub は ${...} を実際の値へ置き換える組込み関数です。
+          Value: !Sub '${Function}:live'
+      Statistic: Sum
+      # 60秒ごとに集計し、その60秒間のエラー数が1以上なら発報します。
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # 実行が無い期間を異常扱いしません。低頻度のバッチではデータ欠損が普通のためです。
+      TreatMissingData: notBreaching
+      # 発報時に通知するSNS Topic。
+      # 通知先が未設定なら AWS::NoValue でAlarmActionsごと省略します。
+      # 空文字のARNを指定するとデプロイに失敗するため、この書き方で回避しています。
+      AlarmActions:
+        !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # 遅延の検知。Timeout（30秒）へ近づいたことを事前に把握するためのAlarmです。
+  DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-duration'
+      AlarmDescription: A live invocation takes at least 24 seconds (timeout is 30 seconds).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Function
+        - Name: Resource
+          Value: !Sub '${Function}:live'
+      # 平均ではなく最大値を見ます。一部の遅い実行を平均で薄めないためです。
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      # 単位はミリ秒。Timeoutの8割を閾値にしています。
+      # Timeoutを変更する場合は、この値も合わせて見直してください。
+      Threshold: 24000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+# デプロイ後に参照する値。マネジメントコンソールやCLIから確認できます。
+# Log Group名だけはCloudFormationが生成するため、ここで確認します。
+Outputs:
+  FunctionName:
+    Description: Lambda function name (same as the stack name); invoke with qualifier live.
+    Value: !Ref Function
+  LiveAliasArn:
+    Description: Invoke this alias to use the SAM-managed release.
+    # FunctionAliaslive は、AutoPublishAliasによってSAMが自動生成する
+    # Alias Resourceの論理IDです（<関数の論理ID> + Alias + <Alias名>）。
+    Value: !Ref FunctionAliaslive
+  ScheduleName:
+    Description: EventBridge Scheduler schedule that invokes the live alias.
+    Value: !Ref Schedule
+  LogGroupName:
+    Description: Log group of this function; the name is generated by CloudFormation.
+    Value: !Ref LogGroup
+  ErrorsAlarmName:
+    Description: Alarm that fires on a failed invocation; also gates the alias switch.
+    Value: !Ref ErrorsAlarm
+  DurationAlarmName:
+    Description: Alarm that fires when an invocation approaches the timeout.
+    Value: !Ref DurationAlarm

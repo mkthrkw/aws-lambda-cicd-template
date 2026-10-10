@@ -1,0 +1,30 @@
+# Deploy Stage用のCodeBuild定義。
+# BuildArtifactの中身をそのままAWSへ配備します。ここで再ビルドはしません。
+#
+# 入力は2つあり、PrimarySourceはSourceArtifactです。
+#   CODEBUILD_SRC_DIR              : SourceArtifact（Buildspecと補助コードの取得元）
+#   CODEBUILD_SRC_DIR_BuildArtifact: BuildArtifact（配備するTemplate・コード・設定）
+# 出力Artifactはありません。処理の詳細は deployment/README.md を参照してください。
+version: 0.2
+
+env:
+  variables:
+    SAM_CLI_TELEMETRY: '0'   # SAM CLIの利用統計送信を止めます。
+    AWS_PAGER: ''            # AWS CLIの出力がページャで止まらないようにします（CIは非対話）。
+
+phases:
+  install:
+    on-failure: ABORT
+    runtime-versions:
+      python: '3.12'
+    commands:
+      # Buildと同じrequirements.txtを使い、SAMのバージョンをStage間でそろえます。
+      - python -m pip install -r deployment/buildspecs/requirements.txt
+      - sam --version
+      - aws --version        # AWS CLI v2が使えるCodeBuildイメージを前提にしています。
+  build:
+    on-failure: ABORT
+    commands:
+      # 検証・Account確認・sam deployの実行はdeploy.pyが担当します。
+      # 2つの入力の場所を明示して渡し、どちらを読むかを曖昧にしません。
+      - python -m deployment.scripts.deploy --source-dir "${CODEBUILD_SRC_DIR:?SourceArtifact is required}" --artifact-dir "${CODEBUILD_SRC_DIR_BuildArtifact:?BuildArtifact is required}"

@@ -1,0 +1,7 @@
+{
+  "parameters": {
+    "Environment": "prod",
+    "ScheduleState": "DISABLED"
+  },
+  "runtimes": {}
+}

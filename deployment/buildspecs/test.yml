@@ -1,0 +1,20 @@
+# Test Stage用のCodeBuild定義。
+# pytestを実行するだけで、ビルド成果物の作成もAWSへの変更も行いません。
+# 環境指定（DEPLOY_ENV）もSAMも不要なため、依存は最小限にしています。
+#
+# 入力: SourceArtifact / 出力: テスト結果とログのみ
+version: 0.2
+
+phases:
+  install:
+    on-failure: ABORT
+    runtime-versions:
+      python: '3.12'         # 他のStageおよびLambda Runtimeと同じバージョンにそろえます。
+    commands:
+      # テスト用の依存のみを導入します（SAM CLIやcfn-lintはここでは入れません）。
+      - python -m pip install -r requirements-dev.txt
+  build:
+    on-failure: ABORT
+    commands:
+      # 設定は pytest.ini に従います。失敗すればCodeBuildもそのまま失敗します。
+      - python -m pytest

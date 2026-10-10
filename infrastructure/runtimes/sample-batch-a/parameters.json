@@ -1,0 +1,3 @@
+{
+  "ScheduleExpression": "cron(0 3 * * ? *)"
+}

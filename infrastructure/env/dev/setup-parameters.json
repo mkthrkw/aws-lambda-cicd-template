@@ -1,0 +1,18 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "example-project"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "GitHubRepositoryId",
+    "ParameterValue": "example-owner/example-repository"
+  },
+  {
+    "ParameterKey": "BranchName",
+    "ParameterValue": "develop"
+  }
+]
